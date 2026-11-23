@@ -1,0 +1,17 @@
+{
+  "id": "john.devin",
+  "name": "Devin",
+  "apiVersion": 1,
+  "description": "Harness local do Devin via ACP, com ferramentas Buzz e revisão manual de permissões.",
+  "discovery": { "category": "agents", "tags": ["devin", "acp"] },
+  "host": {
+    "processes": [{ "id": "devin", "program": "devin", "args": ["acp"] }],
+    "commands": [
+      { "id": "version", "program": "devin", "args": ["version"], "maxOutputBytes": 4096 },
+      { "id": "codex-rollout", "program": "sh", "args": ["-c", "latest=$(find \"$HOME/.codex/sessions\" -type f -name 'rollout-*.jsonl' -printf '%T@ %p\\n' 2>/dev/null | sort -rn | head -n 1) && f=${latest#* } && [ -f \"$f\" ] && echo \"${latest%% *}\" && grep rate_limits \"$f\" | tail -n 1"], "maxOutputBytes": 65536 }
+    ],
+    "mcp": true,
+    "files": true,
+    "networkOrigins": ["https://server.codeium.com", "https://chatgpt.com"]
+  }
+}
