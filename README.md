@@ -2,6 +2,8 @@
 
 Harness local via ACP. ID do plugin: `john.devin`; tipo de agente: `john.devin/devin`.
 
+> Compatibilidade: plugin para o **Buzz 1.x.x** (aplicativo desktop novo). Não se aplica ao Buzz legado.
+
 ## Instalar
 
 1. Confirme que `devin` está no PATH herdado pelo aplicativo Buzz. Faça `devin auth login` no terminal se necessário; não cole credenciais no chat.
