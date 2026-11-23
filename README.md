@@ -39,6 +39,8 @@ Pedidos ACP restantes só recebem consentimento após clique em **Permitir uma v
 - Turnos limitados a 30 minutos pelo host; o prompt ACP tem deadline de 29 minutos.
 - Após cada turno, o uso real por request é lido do `/session-stats` (sem inferência) e gravado por agente/conversa, exposto ao plugin Usage do Buzz pelo contrato `usage`. O `inputTokens` do Devin inclui cache e é separado na gravação. Cada request guarda o próprio rótulo de modelo (a cobrança varia por modelo: swe-2 é incluído no plano, Claude-via-Devin consome) e qualquer `acuCost`/`creditCost` reportado; `acuAmount` do `usage_update` entra no fallback consolidado. Custo em USD depende do `tokenCostUsd` que o Devin reportar e pode ficar parcial.
 - O indicador de limites fica no chrome ao lado da busca: um cluster ícone+dois anéis por provider detectado (Devin, Codex), com popover por hover/foco/click mostrando plano, % restante e renovações. O anel do Codex exibe o restante (100 menos o uso) das janelas de 5h e semanal; token expirado usa o último rollout local como fallback e indica a origem. Um painel com o mesmo detalhe e botão Atualizar responde ao alvo `devin:quota`.
+
+  ![Indicador de limites: popover com plano, % restante e renovações do Devin e do Codex](docs/usage.png)
 - Sem voz, execução remota, retomada de sessão nativa ou proteção nativa do Buzz. Agentes protegidos são recusados.
 - A ativação na instalação real e a importação de um agente precisam ser verificadas após a revisão de instalação. Testes locais não substituem essa validação.
 
