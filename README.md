@@ -1,4 +1,4 @@
-# Devin para Buzz
+# Devin para Buzz 1.x.x
 
 Harness local via ACP. ID do plugin: `john.devin`; tipo de agente: `john.devin/devin`.
 
