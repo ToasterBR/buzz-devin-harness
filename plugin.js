@@ -275,19 +275,32 @@ export function apply(ctx) {
     historyLoaded.add(agentKey);
     try {
       const raw = await agents.storage.get(activityKey(agentKey));
-      const rows = Array.isArray(raw && JSON.parse(raw)) ? JSON.parse(raw) : [];
-      if (!histories.has(agentKey)) histories.set(agentKey, new Map(rows.map(row => [row.key, row])));
+      const stored = Array.isArray(raw && JSON.parse(raw)) ? JSON.parse(raw) : [];
+      // A record can land while this load is in flight: live rows win by key,
+      // stored ones fill in behind them, and a row left "working"/"queued" by
+      // a reload reads as interrupted since no lane survives it.
+      const rows = histories.get(agentKey) ?? new Map();
+      for (const row of stored) {
+        if (!row || typeof row.key !== "string" || rows.has(row.key)) continue;
+        rows.set(row.key, { ...row,
+          status: row.status === "working" || row.status === "queued" ? "cancelled" : row.status });
+      }
+      const merged = new Map([...rows.entries()].sort((a, b) => (a[1].at ?? 0) - (b[1].at ?? 0)));
+      histories.set(agentKey, merged);
+      void agents.storage.set(activityKey(agentKey), JSON.stringify([...merged.values()])).catch(() => {});
     } catch { if (!histories.has(agentKey)) histories.set(agentKey, new Map()); }
     emit();
   }
   function recordActivity(agentKey, conversation, status, detail) {
-    if (!historyLoaded.has(agentKey)) {
-      void ensureHistory(agentKey).then(() => recordActivity(agentKey, conversation, status, detail));
-      return;
-    }
+    // Record now and let the load merge stored rows underneath: deferring
+    // replayed a stale status over records that already landed.
+    void ensureHistory(agentKey);
     let rows = histories.get(agentKey);
     if (!rows) histories.set(agentKey, rows = new Map());
     const previous = rows.get(conversation.key) ?? {};
+    // Re-set moves the row to the end so the front is the least recently
+    // active conversation: the one eviction should drop first.
+    rows.delete(conversation.key);
     rows.set(conversation.key, {
       key: conversation.key, channel: conversation.channel,
       ...(conversation.root ? { root: conversation.root } : {}),
@@ -360,24 +373,7 @@ export function apply(ctx) {
   const usageKey = key => `devin.usage.${key}`;
   const num = value => typeof value === "number" && Number.isFinite(value) ? value
     : typeof value === "string" && value.trim() && Number.isFinite(Number(value)) ? Number(value) : undefined;
-  async function ensureUsage(agentKey) {
-    if (usageLoaded.has(agentKey)) return;
-    usageLoaded.add(agentKey);
-    try {
-      const stored = JSON.parse((await agents.storage.get(usageKey(agentKey))) || "null");
-      const rows = Array.isArray(stored?.sessions) ? stored.sessions : [];
-      if (!usageStore.has(agentKey))
-        usageStore.set(agentKey, new Map(rows.filter(s => s && typeof s.id === "string").map(s => [s.id, s])));
-    } catch { if (!usageStore.has(agentKey)) usageStore.set(agentKey, new Map()); }
-  }
-  function recordUsage(agentKey, session) {
-    if (!usageLoaded.has(agentKey)) {
-      void ensureUsage(agentKey).then(() => recordUsage(agentKey, session));
-      return;
-    }
-    let map = usageStore.get(agentKey);
-    if (!map) usageStore.set(agentKey, map = new Map());
-    map.set(session.id, session);
+  function pruneUsage(map) {
     const cutoff = Date.now() - USAGE_MAX_AGE;
     while (map.size > USAGE_LIMIT) {
       let oldest;
@@ -385,6 +381,26 @@ export function apply(ctx) {
       map.delete(oldest.id);
     }
     for (const s of map.values()) if (s.lastAt < cutoff) map.delete(s.id);
+  }
+  async function ensureUsage(agentKey) {
+    if (usageLoaded.has(agentKey)) return;
+    usageLoaded.add(agentKey);
+    try {
+      const stored = JSON.parse((await agents.storage.get(usageKey(agentKey))) || "null");
+      const rows = Array.isArray(stored?.sessions) ? stored.sessions : [];
+      const map = usageStore.get(agentKey) ?? new Map();
+      for (const s of rows) if (s && typeof s.id === "string" && !map.has(s.id)) map.set(s.id, s);
+      pruneUsage(map);
+      usageStore.set(agentKey, map);
+      void agents.storage.set(usageKey(agentKey), JSON.stringify({ v: 1, sessions: [...map.values()] })).catch(() => {});
+    } catch { if (!usageStore.has(agentKey)) usageStore.set(agentKey, new Map()); }
+  }
+  function recordUsage(agentKey, session) {
+    void ensureUsage(agentKey);
+    let map = usageStore.get(agentKey);
+    if (!map) usageStore.set(agentKey, map = new Map());
+    map.set(session.id, session);
+    pruneUsage(map);
     void agents.storage.set(usageKey(agentKey), JSON.stringify({ v: 1, sessions: [...map.values()] })).catch(() => {});
   }
   // Same digest the bundled session-usage helper computes, so a read that saw
@@ -465,7 +481,10 @@ export function apply(ctx) {
     let map = transcripts.get(agentKey);
     if (!map) transcripts.set(agentKey, map = new Map());
     let turns = map.get(conversation.key);
-    if (!turns) map.set(conversation.key, turns = []);
+    // Same recency rule as the history rows: an active conversation re-set to
+    // the end is never the one the limit evicts.
+    if (turns) map.delete(conversation.key); else turns = [];
+    map.set(conversation.key, turns);
     const turn = { at: Date.now(), outcome: "working", items: [], next: 1, agentKey };
     turns.push(turn);
     while (turns.length > TURN_LIMIT) turns.shift();
@@ -599,8 +618,10 @@ export function apply(ctx) {
       return { author: `…${String(trigger.event.pubkey ?? "?").slice(-6)}`, text: clip(trigger.event.content) };
     return { author: delivery.agent.name, text: trigger?.type ? `Disparo ${trigger.type}` : "Turno" };
   }
-  const ACTIVITY_STATUS = { working: "Trabalhando", done: "Concluído", failed: "Falhou", cancelled: "Interrompido" };
-  const SESSION_STATUS = { working: "Working", done: "Done", failed: "Failed", cancelled: "Cancelled" };
+  const ACTIVITY_STATUS = { working: "Trabalhando", queued: "Na fila",
+    done: "Concluído", failed: "Falhou", cancelled: "Interrompido" };
+  const SESSION_STATUS = { working: "Working", queued: "Queued", done: "Done",
+    failed: "Failed", cancelled: "Cancelled" };
   const activityTime = at => new Date(at).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" });
   function InlineHead({ id, title }) {
     return h("div", { "data-buzz-ui": "", className: "buzz-content-header", "data-inline": "" },
@@ -715,26 +736,40 @@ export function apply(ctx) {
     return null;
   }
   const STATUS_COLOR = { done: "var(--text-color-success)", failed: "var(--text-color-danger)",
-    working: "var(--text-color-accent)", cancelled: "var(--text-color-subtle)" };
+    working: "var(--text-color-accent)", queued: "var(--text-color-subtle)",
+    cancelled: "var(--text-color-subtle)" };
+  // The tinted status row the bundled Codex transcript puts on each turn:
+  // green on success, red on failure, accent while working, subtle otherwise.
+  const STATUS_TONE = {
+    done: { background: "var(--surface-status-success)", color: "var(--text-on-status-success)", glyph: "check" },
+    failed: { background: "var(--surface-status-danger)", color: "var(--text-on-status)", glyph: "x" },
+    working: { background: "var(--affordance-accent)", color: "var(--text-accent)" },
+    cancelled: { background: "var(--affordance-subtle)", color: "var(--text-secondary)" },
+  };
+  function StatusRow({ status, label, meta }) {
+    const tone = STATUS_TONE[status] ?? STATUS_TONE.cancelled;
+    return h("div", { className: "text-body", style: { display: "flex", alignItems: "center",
+        gap: "var(--space-2)", minHeight: "var(--space-6)", marginInline: "calc(-1 * var(--space-2))",
+        padding: "var(--space-1) var(--space-2)", borderRadius: "var(--radius-row)",
+        background: tone.background, color: tone.color } },
+      tone.glyph ? icon(tone.glyph) : null,
+      h("span", null, label),
+      meta ? h("span", { style: { marginInlineStart: "auto", fontVariantNumeric: "tabular-nums" } }, meta) : null);
+  }
   function TurnView({ turn, agent, divider }) {
-    const color = STATUS_COLOR[turn.outcome] ?? "var(--text-color-subtle)";
     return h(R.Fragment, null,
       divider && h("div", { role: "separator", style: { display: "flex", alignItems: "center", gap: "var(--space-2)" } },
         h("span", { className: "text-label-sm text-subtle" }, "Nova sessão"),
         h("span", { "aria-hidden": "true", style: { flex: 1, borderTop: "1px solid var(--border-standard)" } })),
       h("article", { style: { display: "grid", gap: "var(--space-3)", minWidth: 0 } },
-        h("div", { style: { display: "flex", alignItems: "center", flexWrap: "wrap", gap: "var(--space-2)" } },
-          h("span", { "aria-hidden": "true", style: { width: "var(--space-2)", height: "var(--space-2)",
-            borderRadius: "var(--radius-capsule)", background: color, flexShrink: 0 } }),
-          h("span", { className: "text-label-sm", style: { color, fontWeight: 600 } },
-            ACTIVITY_STATUS[turn.outcome] ?? turn.outcome),
-          h("span", { className: "text-body-sm text-subtle" },
-            [fmtDur(turn.at, turn.end), turn.end && fmtClock(turn.end)].filter(Boolean).join(" · "))),
+        turn.outcome !== "working" && h(StatusRow, { status: turn.outcome,
+          label: ACTIVITY_STATUS[turn.outcome] ?? turn.outcome,
+          meta: [fmtDur(turn.at, turn.end), turn.end && fmtClock(turn.end)].filter(Boolean).join(" · ") }),
         turn.sections?.length ? h(Sections, { sections: turn.sections }) : null,
         turn.request && h("p", { className: "m-0 text-body-sm", style: { margin: 0 } },
           h("strong", null, turn.request.author), ` ${turn.request.text}`),
         turn.items.map(item => h(Entry, { key: item.id, item, agent })),
-        turn.outcome === "working" && h("p", { className: "m-0 text-body-sm text-subtle", style: { margin: 0 } }, "Trabalhando…")));
+        turn.outcome === "working" && h(StatusRow, { status: "working", label: "Trabalhando" })));
   }
   function TranscriptView({ agent, row, onBack, openThread }) {
     const [, bump] = R.useState(0);
@@ -742,11 +777,12 @@ export function apply(ctx) {
     return h("div", { style: { display: "flex", flexDirection: "column", minWidth: 0, gap: "var(--space-4)" } },
       h("div", { "data-buzz-ui": "", className: "buzz-content-header", "data-inline": "" },
         h("button", { type: "button", className: "buzz-button", "data-variant": "ghost", "data-size": "sm",
-          "aria-label": "Voltar para a lista de conversas", onClick: onBack,
+          "aria-label": "Voltar ao perfil", onClick: onBack,
           style: { display: "inline-flex", alignItems: "center", paddingInline: "var(--space-2)" } }, icon("back")),
         h("div", { className: "buzz-content-header-copy" },
-          h("h3", { className: "buzz-content-header-title" }, "Transcript"),
-          row.where && h("p", { className: "buzz-content-header-subtitle" }, row.where)),
+          h("h3", { className: "buzz-content-header-title" }, row.where || (row.channel || "").slice(0, 8) || "Transcript"),
+          h("p", { className: "buzz-content-header-subtitle" },
+            [row.root ? `Thread ${row.root.slice(0, 8)}` : "Canal", "Transcript"].join(" · "))),
         h("div", { className: "buzz-content-header-actions" },
           h("button", { type: "button", className: "buzz-button", "data-variant": "ghost", "data-size": "sm",
             "aria-label": "Atualizar transcript", onClick: () => bump(n => n + 1),
@@ -778,7 +814,7 @@ export function apply(ctx) {
       if (hereKey) setOpen(hereKey);
       initialTranscript.done();
     }, [initialTranscript?.opening]);
-    const rows = activityRows(agent.key).slice().reverse();
+    const rows = activityRows(agent.key).sort((a, b) => (b.at ?? 0) - (a.at ?? 0));
     if (open) {
       const row = rows.find(r => r.key === open)
         ?? { key: open, channel: open.split("/")[0], root: open.split("/")[1] };
@@ -788,11 +824,26 @@ export function apply(ctx) {
     }
     const here = conversation ? rows.find(row => row.key === hereKey) : undefined;
     const laneState = hereKey ? lanes.get(`${agent.key}/${hereKey}`) : undefined;
-    const working = Boolean(laneState && (laneState.active || laneState.queue.length));
+    const live = laneState?.active ? "working" : laneState?.queue.length ? "queued" : undefined;
+    const busy = Boolean(live);
     const recent = rows.filter(row => row.key !== hereKey);
     const nameOf = row => row.where || row.channel.slice(0, 8);
     const rowStyle = { display: "flex", alignItems: "center", flexWrap: "wrap", gap: "var(--space-3)", minWidth: 0 };
     const copyStyle = { flex: "1 1 12rem", minWidth: 0, overflowWrap: "anywhere" };
+    const statusTag = status => h("span", { style: { color: STATUS_COLOR[status] ?? "var(--text-color-subtle)" } },
+      ACTIVITY_STATUS[status] ?? status);
+    // The latest-activity note Codex puts under each row: expandable while
+    // the session works, a quiet line once it settles.
+    const detail = row => {
+      if (!row?.detail) return null;
+      return (live && row.key === hereKey ? live : row.status) === "working"
+        ? h("details", { style: boxStyle },
+            h("summary", { className: "text-body-sm", style: sumStyle }, caret(), "Última atividade"),
+            h("pre", { className: "text-mono",
+              style: { ...codeStyle, maxHeight: "12rem", margin: "0 var(--space-3) var(--space-3)" } }, row.detail))
+        : h("p", { className: "m-0 text-body-sm text-subtle",
+            style: { margin: 0, whiteSpace: "pre-wrap", overflowWrap: "anywhere" } }, row.detail);
+    };
     const transcriptButton = row =>
       h("button", { type: "button", className: "buzz-button", "data-variant": "subtle", "data-size": "sm",
         "aria-label": `Ver transcript: ${nameOf(row)}`, onClick: () => setOpen(row.key) }, "Ver transcript");
@@ -803,23 +854,29 @@ export function apply(ctx) {
           h("div", { style: copyStyle },
             h("span", { className: "text-label-sm", style: { display: "block" } }, nameOf(row)),
             h("p", { className: "m-0 text-body-sm text-subtle", style: { margin: 0 } },
-              [row.root ? `Thread ${row.root.slice(0, 8)}` : "Canal", ACTIVITY_STATUS[row.status], row.at ? activityTime(row.at) : ""].filter(Boolean).join(" · "))),
-          transcriptButton(row)));
+              row.root ? `Thread ${row.root.slice(0, 8)}` : "Canal",
+              row.status && h(R.Fragment, null, " · ", statusTag(row.status)),
+              row.at ? ` · ${activityTime(row.at)}` : null)),
+          transcriptButton(row)),
+        detail(row));
     return h("div", { style: { display: "flex", flexDirection: "column", minWidth: 0, gap: "var(--space-6)" } },
       conversation && h("section", { "aria-labelledby": `${headId}-here`, style: { display: "grid", gap: "var(--space-2)", minWidth: 0 } },
         h(InlineHead, { id: `${headId}-here`, title: `Est${conversation.rootId ? "e tópico" : "a conversa"}` }),
         h("div", { "data-buzz-ui": "", className: "buzz-settings-group", "data-layout": "form" },
           h("div", { style: { display: "grid", gap: "var(--space-2)" } },
             h("div", { style: rowStyle },
-              here || working ? h("span", { style: copyStyle },
+              here || busy ? h("span", { style: copyStyle },
                   h("span", { className: "text-label-sm", style: { display: "block" } }, here ? nameOf(here) : conversation.channelId.slice(0, 8)),
                   h("span", { className: "text-body-sm text-subtle", style: { display: "block" } },
-                    [working ? "Trabalhando agora" : ACTIVITY_STATUS[here?.status], here?.at && `Última atividade ${activityTime(here.at)}`].filter(Boolean).join(" · ")))
+                    live === "working" ? statusTag("working") : statusTag(live ?? here?.status),
+                    live === "working" ? " agora" : null,
+                    (live ?? here?.status) && here?.at ? ` · Última atividade ${activityTime(here.at)}` : null))
                 : h("span", { style: { display: "grid", gap: "var(--space-1)" } },
                   h("span", { className: "text-label" }, "Nenhuma sessão Devin aqui ainda"),
                   h("span", { className: "text-body-sm text-subtle" }, `Uma começa quando você mencionar o agente ${conversation.rootId ? "neste tópico" : "nesta conversa"}.`)),
-              (here || working) && transcriptButton(here ?? { key: hereKey, channel: conversation.channelId,
-                root: conversation.rootId }))))),
+              (here || busy) && transcriptButton(here ?? { key: hereKey, channel: conversation.channelId,
+                root: conversation.rootId })),
+            detail(here)))),
       h("section", { style: { display: "grid", gap: "var(--space-2)", minWidth: 0 } },
         h(InlineHead, { title: "Conversas recentes" }),
         h("div", { "data-buzz-ui": "", className: "buzz-settings-group", "data-layout": "form" },
@@ -1179,6 +1236,9 @@ export function apply(ctx) {
   function enqueue(lane, entry) {
     if (entry.settled) return;
     lane.queue.push(entry);
+    // One row per conversation: a live turn already reads Trabalhando, so a
+    // delivery waiting behind it leaves the row alone.
+    if (!lane.active) recordActivity(entry.delivery.agent.key, entry.conversation, "queued");
     lane.tail = lane.tail.then(() => drain(lane).catch(() => {}));
     emit();
   }
@@ -1208,7 +1268,10 @@ export function apply(ctx) {
       if (entry.settled) return;
       if (entry.joinedAbort) { entry.joinedAbort(); return; }
       const at = lane.queue.indexOf(entry);
-      if (at >= 0) lane.queue.splice(at, 1);
+      if (at >= 0) {
+        lane.queue.splice(at, 1);
+        if (!lane.active) recordActivity(delivery.agent.key, conversation, "cancelled");
+      }
       if (lane.active?.entry === entry) return lane.active.stop();
       entry.finish({ ok: true, stopped: true });
     };
@@ -1258,8 +1321,9 @@ export function apply(ctx) {
       entry.acked = received = true;
       const steering = active.steer(prompt.text, controller.signal);
       const request = requestFrom(delivery, prompt.text);
-      push(active.turn, { t: "status",
-        text: `${request.author} adicionou ao turno em execução: ${clip(request.text, 300)}` });
+      const note = `${request.author} adicionou ao turno em execução: ${clip(request.text, 300)}`;
+      push(active.turn, { t: "status", text: note });
+      recordActivity(delivery.agent.key, conversation, "working", note);
       saveTranscripts(delivery.agent.key);
       delivery.step?.("Devin", "Mensagem incorporada ao turno em execução");
       await steering;
@@ -1284,8 +1348,10 @@ export function apply(ctx) {
   }
   async function executeTurn(lane, entry) {
     const { delivery, conversation, cfg } = entry;
-    if (disposed || delivery.signal.aborted || !delivery.current())
+    if (disposed || delivery.signal.aborted || !delivery.current()) {
+      recordActivity(delivery.agent.key, conversation, "cancelled");
       return entry.finish({ ok: true, stopped: true });
+    }
     const kit = agents.harness;
     const controller = new AbortController();
     const forward = () => controller.abort();
@@ -1509,8 +1575,13 @@ export function apply(ctx) {
       }
       saveTranscripts(delivery.agent.key);
       emit();
-      if (received) recordActivity(delivery.agent.key, conversation, outcome ?? "failed",
-        finalText.trim().slice(-800) || (lastStep && `Devin: ${lastStep}`) || undefined);
+      // The "working" row went in before the session attempt, so the final
+      // status lands even when the process failed before any prompt ran;
+      // without it the tab kept showing a dead turn as Trabalhando.
+      recordActivity(delivery.agent.key, conversation, outcome ?? "failed",
+        finalText.trim().slice(-800)
+          || (outcome === "failed" && failure ? clip(failure, 400) : undefined)
+          || (lastStep && `Devin: ${lastStep}`) || undefined);
       if (!received) prompt?.restore?.();
       controller.abort();
       delivery.signal.removeEventListener("abort", forward);
@@ -1562,7 +1633,7 @@ export function apply(ctx) {
     sessions: {
       list: agentKey => {
         void ensureHistory(agentKey);
-        return activityRows(agentKey).map(row => ({
+        return activityRows(agentKey).sort((a, b) => (b.at ?? 0) - (a.at ?? 0)).map(row => ({
           channelId: row.channel, ...(row.root ? { root: row.root } : {}), at: row.at,
           status: SESSION_STATUS[row.status] ?? row.status }));
       },

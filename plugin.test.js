@@ -529,6 +529,47 @@ test('activity lists sessions with a Ver transcript entry point', async () => {
   assert.ok(!JSON.stringify(tree).includes('Abrir conversa'));
 });
 
+test('a turn that fails before any prompt records failed instead of hanging as working', async () => {
+  const s = setup({ newError: true });
+  const d = s.delivery();
+  await s.type.run(d);
+  await d.held[0];
+  await flush();
+  const rows = JSON.parse(s.storeData.get('devin.activity.Agent'));
+  const row = rows.find(r => r.key === 'room/thread');
+  assert.equal(row.status, 'failed');
+  assert.ok(row.detail.includes('login required'));
+});
+
+test('a delivery stopped before its turn records cancelled, never stuck queued', async () => {
+  const s = setup();
+  const d = s.delivery(); d.controller.abort();
+  await s.type.run(d);
+  await d.held[0];
+  await flush();
+  const rows = JSON.parse(s.storeData.get('devin.activity.Agent'));
+  assert.equal(rows.find(r => r.key === 'room/thread').status, 'cancelled');
+});
+
+test('activity merge keeps stored rows and re-recording wins recency over eviction', async () => {
+  const s = setup();
+  const seeded = [{ key: 'r0', channel: 'room', at: 1, status: 'working' },
+    ...Array.from({ length: 11 }, (_, i) => ({ key: `r${i + 1}`, channel: 'room', at: i + 2, status: 'done' }))];
+  s.storeData.set('devin.activity.Agent', JSON.stringify(seeded));
+  const d = s.delivery(); d.conv = 'r0';
+  await s.type.run(d);
+  await d.held[0];
+  const d2 = s.delivery(); d2.conv = 'x/new';
+  await s.type.run(d2);
+  await d2.held[0];
+  await flush();
+  const rows = JSON.parse(s.storeData.get('devin.activity.Agent'));
+  assert.equal(rows.length, 12);
+  assert.ok(rows.some(r => r.key === 'r0' && r.status === 'done'));
+  assert.ok(rows.some(r => r.key === 'x/new'));
+  assert.ok(!rows.some(r => r.key === 'r1'));
+});
+
 test('transcript records ACP steps and renders request, thought, tool I/O and plan', async () => {
   const s = setup({ promptText: '<buzz-event>\n{"pubkey":"aa11","display_name":"John"}\nRequest: "verifique os dados"\n</buzz-event>',
     updates: [
