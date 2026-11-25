@@ -3,10 +3,9 @@ import assert from 'node:assert/strict';
 import { apply } from './plugin.js';
 
 function setup(options = {}) {
-  let type, page, panel, receive, process;
-  let resolveExit;
+  let type, page, panel;
   let toolsHandler;
-  const replies = [], requests = [], effects = [], readPaths = [], hostRequests = [];
+  const replies = [], requests = [], effects = [], readPaths = [], hostRequests = [], processes = [];
   let killed = 0, closed = 0, restored = 0;
   const jsx = (tag, props, ...children) => ({ tag, props, children });
   const storeData = new Map();
@@ -49,18 +48,20 @@ function setup(options = {}) {
       spawn: async (id, opts) => {
         // Native spawn rejects extra fields, including the server lifecycle promise.
         if (opts.mcp) assert.deepEqual(Object.keys(JSON.parse(JSON.stringify(opts.mcp))).sort(), ['headers', 'url']);
-        receive = value => opts.onStdout(JSON.stringify(value) + '\n');
-        let promptSeen = 0;
-        process = {
+        const handler = toolsHandler;
+        let promptSeen = 0, resolveExit;
+        const process = {
+          requests: [],
           exited: new Promise(r => { resolveExit = r; }),
           kill: async () => { killed++; resolveExit(0); },
+          receive: value => opts.onStdout(JSON.stringify(value) + '\n'),
           write: async line => {
-            const msg = JSON.parse(line); requests.push(msg);
+            const msg = JSON.parse(line); process.requests.push(msg); requests.push(msg);
             if (!msg.method) return;
-            const answer = result => receive({ jsonrpc: '2.0', id: msg.id, result });
+            const answer = result => process.receive({ jsonrpc: '2.0', id: msg.id, result });
             if (msg.method === 'initialize') answer({ protocolVersion: 1, agentCapabilities: { mcpCapabilities: { http: true } } });
             if (msg.method === 'session/new') {
-              if (options.newError) receive({ id: msg.id, error: { message: 'login required' } });
+              if (options.newError) process.receive({ id: msg.id, error: { message: 'login required' } });
               else if (options.holdNew) { options.started?.(); return; }
               else answer({ sessionId: 'session',
                 modes: { availableModes: ['smart', 'accept-edits', 'bypass'].map(id => ({ id })) },
@@ -70,7 +71,7 @@ function setup(options = {}) {
             if (msg.method === 'session/set_mode') answer({});
             if (msg.method === 'session/prompt') {
               if (msg.params?.prompt?.[0]?.text === '/session-stats') {
-                if (options.statsMeta) receive({ method: 'session/update', params: { update: {
+                if (options.statsMeta) process.receive({ method: 'session/update', params: { update: {
                   sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'stats' },
                   _meta: { 'cognition.ai/sessionStats': options.statsMeta } } } });
                 answer({ stopReason: 'end_turn' });
@@ -80,12 +81,12 @@ function setup(options = {}) {
               if (options.wait && promptSeen === 1) { options.started?.(); return; }
               if (options.holdSteer && promptSeen > 1) { options.steered?.(msg); return; }
               for (const u of options.updates ?? [])
-                receive({ method: 'session/update', params: { update: u } });
-              if (options.post) await toolsHandler({ id: 1, method: 'tools/call',
+                process.receive({ method: 'session/update', params: { update: u } });
+              if (options.post) await handler({ id: 1, method: 'tools/call',
                 params: { name: 'send', arguments: { text: options.postText } } });
               if (options.permission) {
-                if (options.toolUpdate) receive({ method: 'session/update', params: { update: options.toolUpdate } });
-                receive({ id: 900, method: 'session/request_permission', params: {
+                if (options.toolUpdate) process.receive({ method: 'session/update', params: { update: options.toolUpdate } });
+                process.receive({ id: 900, method: 'session/request_permission', params: {
                   toolCall: options.permissionCall || { title: 'Write file', rawInput: { path: '/tmp/file' } },
                   options: [{ kind: 'allow_once', optionId: 'allow' }, { kind: 'reject_once', optionId: 'deny' }],
                 } });
@@ -98,6 +99,7 @@ function setup(options = {}) {
             }
           },
         };
+        processes.push(process);
         options.spawned?.(opts);
         return process;
       },
@@ -106,15 +108,19 @@ function setup(options = {}) {
   apply(ctx);
   function delivery(name = 'Agent') {
     const controller = new AbortController();
+    const held = [], acks = [];
     return { agent: { key: name, name }, config: { cwd: '/workspace', model: 'test-model' },
-      signal: controller.signal, current: () => true,
-      interruptible: stop => { controller.stop = stop; }, controller };
+      signal: controller.signal, current: () => true, held, acks,
+      interruptible: stop => { controller.stop = stop; },
+      workingUntil: p => { held.push(p); },
+      acknowledged: input => { acks.push(input); },
+      controller };
   }
   return { ctx, get type() { return type; }, get page() { return page; }, get panel() { return panel; },
-    delivery, replies, requests, hostRequests,
+    delivery, replies, requests, hostRequests, processes,
     storeData,
     cleanup: async () => { for (const fn of effects) await fn?.(); },
-    stats: () => ({ killed, closed, restored }), receive: value => receive(value),
+    stats: () => ({ killed, closed, restored }),
   };
 }
 
@@ -130,7 +136,9 @@ test('registers Devin and preserves imported model and instructions', () => {
 test('handles fragmented ACP, passes MCP, posts final text and closes resources', async () => {
   let spawned;
   const s = setup({ spawned: opts => spawned = opts });
-  await s.type.run(s.delivery());
+  const d = s.delivery();
+  await s.type.run(d);
+  await d.held[0];
   assert.deepEqual(s.replies, [{ agent: 'Agent', text: 'OK' }]);
   assert.equal(spawned.env.DEVIN_PERMISSION_MODE, 'auto');
   assert.deepEqual(spawned.args, ['--model', 'test-model']);
@@ -140,48 +148,79 @@ test('handles fragmented ACP, passes MCP, posts final text and closes resources'
   assert.ok(s.stats().killed >= 1);
 });
 test('successful Buzz send suppresses duplicate fallback; failed send does not', async () => {
-  const s = setup({ post: true }); await s.type.run(s.delivery()); assert.equal(s.replies.length, 0);
-  const f = setup({ post: true, toolError: true }); await f.type.run(f.delivery()); assert.equal(f.replies.length, 1);
+  const s = setup({ post: true }); const d = s.delivery();
+  await s.type.run(d); await d.held[0]; assert.equal(s.replies.length, 0);
+  const f = setup({ post: true, toolError: true }); const fd = f.delivery();
+  await f.type.run(fd); await fd.held[0]; assert.equal(f.replies.length, 1);
 });
 test('unadmitted and protected deliveries never start a process', async () => {
   const s = setup(); const d = s.delivery(); d.noConversation = true; await s.type.run(d);
   assert.equal(s.requests.length, 0);
+  assert.equal(d.held.length, 0);
   const p = s.delivery(); p.agent.protection = {}; await assert.rejects(s.type.run(p), /protegidos/);
 });
 test('ACP failure reaches host and releases resources', async () => {
-  const s = setup({ newError: true }); await assert.rejects(s.type.run(s.delivery()), /login required/);
+  const s = setup({ newError: true }); const d = s.delivery();
+  await s.type.run(d);
+  const outcome = await d.held[0];
+  assert.equal(outcome.ok, false); assert.match(outcome.error, /login required/);
   assert.equal(s.stats().closed, 1); assert.equal(s.replies.length, 0);
+});
+test('run returns after admission while the turn still runs', async () => {
+  let started; const ready = new Promise(r => started = r);
+  const s = setup({ wait: true, started }); const d = s.delivery();
+  await s.type.run(d);
+  await ready;
+  assert.equal(d.held.length, 1);
+  assert.equal(s.stats().killed, 0);
+  await d.controller.stop();
+  const outcome = await d.held[0];
+  assert.equal(outcome.stopped, true);
 });
 test('Stop interrupts a pending prompt and permits a later turn', async () => {
   let started; const ready = new Promise(r => started = r);
   const options = { wait: true, started }; const s = setup(options); const d = s.delivery();
-  const running = s.type.run(d); const rejected = assert.rejects(running, /interrompido/);
-  await ready; await d.controller.stop(); await rejected;
+  await s.type.run(d);
+  await ready; await d.controller.stop();
+  const outcome = await d.held[0];
+  assert.equal(outcome.stopped, true);
   assert.equal(s.stats().closed, 1);
-  options.wait = false; await s.type.run(s.delivery()); assert.equal(s.replies.length, 1);
+  options.wait = false; const d2 = s.delivery();
+  await s.type.run(d2); await d2.held[0]; assert.equal(s.replies.length, 1);
 });
 test('reply tracking resets between turns of the same harness', async () => {
   const options = { post: true }; const s = setup(options);
-  await s.type.run(s.delivery('one')); options.post = false;
-  await s.type.run(s.delivery('two'));
+  const d1 = s.delivery('one');
+  await s.type.run(d1); await d1.held[0]; options.post = false;
+  const d2 = s.delivery('two');
+  await s.type.run(d2); await d2.held[0];
   assert.deepEqual(s.replies, [{ agent: 'two', text: 'OK' }]);
 });
 test('permission is only granted by explicit UI action; unload cancels pending work', async () => {
   let started; const ready = new Promise(r => started = r);
   const s = setup({ permission: true, started }); const d = s.delivery();
-  const running = s.type.run(d); const rejected = assert.rejects(running, /interrompido/);
+  await s.type.run(d);
   await ready;
   assert.equal(s.requests.some(m => m.id === 900), false);
   const tree = s.page.component();
   assert.ok(JSON.stringify(tree, (k,v) => typeof v === 'function' ? undefined : v).includes('Write file'));
-  await s.cleanup(); await rejected;
+  await s.cleanup();
+  const outcome = await d.held[0];
+  assert.equal(outcome.stopped, true);
   assert.equal(s.stats().closed, 1);
 });
-test('aborted turn and non-end stop reasons never publish fallback', async () => {
-  const s = setup({ reason: 'max_tokens' }); await assert.rejects(s.type.run(s.delivery()), /max_tokens/);
-  assert.equal(s.replies.length, 0);
-  const b = setup(); const d = b.delivery(); d.controller.abort();
-  await assert.rejects(b.type.run(d)); assert.equal(b.requests.length, 0);
+test('an aborted delivery never spawns and a failed turn posts a short error line', async () => {
+  const s = setup({ reason: 'max_tokens' }); const d = s.delivery();
+  await s.type.run(d);
+  const outcome = await d.held[0];
+  assert.equal(outcome.ok, false); assert.match(outcome.error, /max_tokens/);
+  assert.equal(s.replies.length, 1);
+  assert.ok(s.replies[0].text.includes('falhou'));
+  const b = setup(); const d2 = b.delivery(); d2.controller.abort();
+  await b.type.run(d2);
+  const aborted = await d2.held[0];
+  assert.equal(aborted.stopped, true);
+  assert.equal(b.requests.length, 0);
 });
 
 test('discovers account models without prompting, caches and preserves an imported model', async () => {
@@ -206,7 +245,7 @@ test('owner permission setting selects ACP mode and per-turn model takes precede
   for (const [permissionMode, modeId] of [['smart', 'smart'], ['accept-edits', 'accept-edits'], ['dangerous', 'bypass']]) {
     let spawned; const s = setup({ spawned: opts => spawned = opts }); const d = s.delivery();
     d.config.permissionMode = permissionMode; d.model = 'other';
-    await s.type.run(d);
+    await s.type.run(d); await d.held[0];
     assert.equal(spawned.env.DEVIN_PERMISSION_MODE, permissionMode);
     assert.deepEqual(spawned.args, ['--model', 'other']);
     assert.equal(s.requests.find(m => m.method === 'session/set_mode').params.modeId, modeId);
@@ -217,52 +256,85 @@ test('permission shows ACP text content even when rawInput is empty', async () =
   let started; const ready = new Promise(r => started = r);
   const s = setup({ permission: true, started, permissionCall: { title: 'Execute', rawInput: {},
     content: [{ type: 'content', content: { type: 'text', text: 'printf hello' } }] } });
-  const d = s.delivery(); const running = s.type.run(d); const rejected = assert.rejects(running, /interrompido/);
+  const d = s.delivery(); await s.type.run(d);
   await ready;
   const tree = JSON.stringify(s.page.component(), (k, v) => typeof v === 'function' ? undefined : v);
   assert.ok(tree.includes('printf hello'));
   assert.equal(s.requests.some(m => m.id === 900), false);
-  await d.controller.stop(); await rejected;
+  await d.controller.stop();
+  const outcome = await d.held[0];
+  assert.equal(outcome.stopped, true);
 });
 test('missing permission details explain the absence instead of displaying empty JSON', async () => {
   let started; const ready = new Promise(r => started = r);
   const s = setup({ permission: true, started, permissionCall: { title: 'Execute', rawInput: {} } });
-  const d = s.delivery(); const running = s.type.run(d); const rejected = assert.rejects(running, /interrompido/);
+  const d = s.delivery(); await s.type.run(d);
   await ready;
   assert.ok(JSON.stringify(s.page.component()).includes('não forneceu os argumentos'));
-  await d.controller.stop(); await rejected;
+  await d.controller.stop();
+  const outcome = await d.held[0];
+  assert.equal(outcome.stopped, true);
 });
-test('queue mode refuses a second concurrent delivery on the same conversation', async () => {
+test('queue mode serializes a second delivery on the same conversation', async () => {
   let started; const ready = new Promise(r => started = r);
-  let spawns = 0;
-  const options = { wait: true, started, spawned: () => spawns++ };
+  const options = { wait: true, started };
   const s = setup(options); const d = s.delivery();
-  const running = s.type.run(d); const rejected = assert.rejects(running, /interrompido/);
+  await s.type.run(d);
   await ready;
-  await assert.rejects(s.type.run(s.delivery()), /trabalhando nesta conversa/);
-  await d.controller.stop(); await rejected;
-  assert.equal(spawns, 1);
-  assert.equal(s.requests.filter(m => m.method === 'session/prompt').length, 1);
+  const d2 = s.delivery();
+  await s.type.run(d2);
+  assert.equal(d2.held.length, 1);
+  assert.equal(s.processes.length, 1);
+  options.wait = false;
+  const first = s.processes[0].requests.find(m => m.method === 'session/prompt');
+  s.processes[0].receive({ jsonrpc: '2.0', id: first.id, result: { stopReason: 'end_turn' } });
+  await d.held[0];
+  await d2.held[0];
+  assert.equal(s.processes.length, 2);
+  assert.equal(s.requests.filter(m => m.method === 'session/new').length, 2);
+});
+
+test('a different conversation spawns its own turn in parallel', async () => {
+  let started; const ready = new Promise(r => started = r);
+  const options = { wait: true, started };
+  const s = setup(options); const d = s.delivery();
+  await s.type.run(d);
+  await ready;
+  const d2 = s.delivery(); d2.conv = 'other/thread';
+  await s.type.run(d2);
+  for (let i = 0; i < 50 && s.processes.length < 2; i++) await flush();
+  assert.equal(s.processes.length, 2);
+  options.wait = false;
+  for (const [i, del] of [d, d2].entries()) {
+    s.processes[i].receive({ method: 'session/update', params: { update: {
+      sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'OK' } } } });
+    const prompt = s.processes[i].requests.find(m => m.method === 'session/prompt');
+    s.processes[i].receive({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+    await del.held[0];
+  }
+  assert.equal(s.replies.length, 2);
 });
 
 test('steer mode injects the delivery into the running session without a new process', async () => {
   let started; const ready = new Promise(r => started = r);
-  let spawns = 0;
-  const options = { wait: true, started, spawned: () => spawns++ };
+  const options = { wait: true, started };
   const s = setup(options); const d = s.delivery();
-  const running = s.type.run(d);
+  await s.type.run(d);
   await ready;
   const joined = s.delivery(); joined.config.busyMode = 'steer';
   await s.type.run(joined);
+  const joinedOutcome = await joined.held[0];
+  assert.equal(joinedOutcome.ok, true);
   const prompts = s.requests.filter(m => m.method === 'session/prompt'
     && m.params.prompt[0].text !== '/session-stats');
   assert.equal(prompts.length, 2);
   assert.equal(prompts[1].params.sessionId, prompts[0].params.sessionId);
   assert.equal(prompts[1].params.prompt[0].text, 'TURN');
-  assert.equal(spawns, 1);
+  assert.deepEqual(joined.acks, [{ steering: true }]);
+  assert.equal(s.processes.length, 1);
   assert.equal(s.requests.filter(m => m.method === 'session/new').length, 1);
-  s.receive({ jsonrpc: '2.0', id: prompts[0].id, result: { stopReason: 'end_turn' } });
-  await running;
+  s.processes[0].receive({ jsonrpc: '2.0', id: prompts[0].id, result: { stopReason: 'end_turn' } });
+  await d.held[0];
   assert.deepEqual(s.replies, [{ agent: 'Agent', text: 'OK' }]);
   const turns = JSON.parse(s.storeData.get('devin.transcript.Agent'))['room/thread'];
   assert.equal(turns.length, 1);
@@ -272,7 +344,7 @@ test('steer mode injects the delivery into the running session without a new pro
 
 test('steer without a turn in flight spawns and completes normally', async () => {
   const s = setup(); const d = s.delivery(); d.config.busyMode = 'steer';
-  await s.type.run(d);
+  await s.type.run(d); await d.held[0];
   assert.deepEqual(s.replies, [{ agent: 'Agent', text: 'OK' }]);
 });
 
@@ -281,31 +353,92 @@ test('stopping a joined delivery drops only its request and keeps the owner runn
   let steered; const sent = new Promise(r => steered = r);
   const options = { wait: true, started, holdSteer: true, steered: () => steered() };
   const s = setup(options); const d = s.delivery();
-  const running = s.type.run(d);
+  await s.type.run(d);
   await ready;
   const joined = s.delivery(); joined.config.busyMode = 'steer';
-  const joinedRun = s.type.run(joined);
-  const joinedRejected = assert.rejects(joinedRun, /interrompido/);
+  await s.type.run(joined);
   await sent;
   const killedBefore = s.stats().killed;
-  await joined.controller.stop(); await joinedRejected;
+  await joined.controller.stop();
+  const joinedOutcome = await joined.held[0];
+  assert.equal(joinedOutcome.stopped, true);
   assert.equal(s.stats().killed, killedBefore);
   const prompts = s.requests.filter(m => m.method === 'session/prompt'
     && m.params.prompt[0].text !== '/session-stats');
   assert.equal(prompts.length, 2);
-  s.receive({ jsonrpc: '2.0', id: prompts[0].id, result: { stopReason: 'end_turn' } });
-  await running;
+  s.processes[0].receive({ jsonrpc: '2.0', id: prompts[0].id, result: { stopReason: 'end_turn' } });
+  await d.held[0];
 });
 
-test('steer during session setup or outside the prompt refuses like queue', async () => {
+test('a steer bound delivery queues while the session is not joinable', async () => {
   let started; const ready = new Promise(r => started = r);
   const options = { holdNew: true, started };
   const s = setup(options); const d = s.delivery();
-  const running = s.type.run(d); const rejected = assert.rejects(running, /interrompido/);
+  await s.type.run(d);
   await ready;
   const joined = s.delivery(); joined.config.busyMode = 'steer';
-  await assert.rejects(s.type.run(joined), /trabalhando nesta conversa/);
-  await d.controller.stop(); await rejected;
+  await s.type.run(joined);
+  assert.equal(s.processes.length, 1);
+  options.holdNew = false;
+  await d.controller.stop();
+  const outcome = await d.held[0];
+  assert.equal(outcome.stopped, true);
+  await joined.held[0];
+  assert.equal(s.processes.length, 2);
+});
+
+test('a steer that misses the turn becomes the next turn reusing its prompt', async () => {
+  let started; const ready = new Promise(r => started = r);
+  const options = { wait: true, started, promptText: 'JOINED TEXT' };
+  const s = setup(options); const d = s.delivery();
+  await s.type.run(d);
+  await ready;
+  const joined = s.delivery(); joined.config.busyMode = 'steer';
+  const admitted = s.type.run(joined);
+  const first = s.processes[0].requests.find(m => m.method === 'session/prompt');
+  s.processes[0].receive({ jsonrpc: '2.0', id: first.id, result: { stopReason: 'end_turn' } });
+  await admitted;
+  options.wait = false;
+  await d.held[0];
+  await joined.held[0];
+  for (let i = 0; i < 50 && s.processes.length < 2; i++) await flush();
+  assert.equal(s.processes.length, 2);
+  const second = s.processes[1].requests.find(m => m.method === 'session/prompt'
+    && m.params.prompt[0].text !== '/session-stats');
+  assert.equal(second.params.prompt[0].text, 'SYSTEM\n\nJOINED TEXT');
+});
+
+test('a steer with a diverging model waits for the next turn', async () => {
+  let started; const ready = new Promise(r => started = r);
+  const options = { wait: true, started };
+  const s = setup(options); const d = s.delivery();
+  await s.type.run(d);
+  await ready;
+  const joined = s.delivery(); joined.config.busyMode = 'steer'; joined.model = 'other';
+  await s.type.run(joined);
+  for (let i = 0; i < 10; i++) await flush();
+  assert.equal(s.processes.length, 1);
+  options.wait = false;
+  const first = s.processes[0].requests.find(m => m.method === 'session/prompt');
+  s.processes[0].receive({ jsonrpc: '2.0', id: first.id, result: { stopReason: 'end_turn' } });
+  await d.held[0];
+  await joined.held[0];
+  assert.equal(s.processes.length, 2);
+});
+
+test('dispose stops the live turn and settles queued deliveries', async () => {
+  let started; const ready = new Promise(r => started = r);
+  const options = { wait: true, started };
+  const s = setup(options); const d = s.delivery();
+  await s.type.run(d);
+  await ready;
+  const d2 = s.delivery();
+  await s.type.run(d2);
+  await s.cleanup();
+  const [o1, o2] = await Promise.all([d.held[0], d2.held[0]]);
+  assert.equal(o1.stopped, true);
+  assert.equal(o2.stopped, true);
+  assert.equal(s.processes.length, 1);
 });
 
 test('registers split settings and an activity tab like the bundled harnesses', () => {
@@ -369,7 +502,9 @@ test('settings renders the identity box with model and permission rows, runtime 
 
 test('runs record conversation activity for the tab and the sessions contract', async () => {
   const s = setup();
-  await s.type.run(s.delivery());
+  const d = s.delivery();
+  await s.type.run(d);
+  await d.held[0];
   const rows = s.type.sessions.list('Agent');
   assert.equal(rows.length, 1);
   assert.equal(rows[0].channelId, 'room');
@@ -384,7 +519,9 @@ const render = node => JSON.stringify(expand(node), (k, v) => typeof v === 'func
 
 test('activity lists sessions with a Ver transcript entry point', async () => {
   const s = setup();
-  await s.type.run(s.delivery());
+  const d = s.delivery();
+  await s.type.run(d);
+  await d.held[0];
   const tree = expand(s.type.tabs[1].component({ agent: { key: 'Agent', name: 'Agent' },
     conversation: { channelId: 'room' } }));
   const buttons = findAll(tree, n => n.tag === 'button');
@@ -404,6 +541,7 @@ test('transcript records ACP steps and renders request, thought, tool I/O and pl
     ] });
   const d = s.delivery(); d.conv = 'room';
   await s.type.run(d);
+  await d.held[0];
   const text = render(s.type.tabs[1].component({ agent: { key: 'Agent', name: 'Agent' },
     conversation: { channelId: 'room' }, initialTranscript: { opening: 1, done() {} } }));
   assert.ok(text.includes('Transcript') && text.includes('Concluído'));
@@ -424,6 +562,7 @@ test('failed tool calls and Buzz calls recorded during a script show in the tran
   ] });
   const d = s.delivery(); d.conv = 'room';
   await s.type.run(d);
+  await d.held[0];
   const stored = JSON.parse(s.storeData.get('devin.transcript.Agent')).room[0];
   const tool = stored.items.find(i => i.t === 'tool');
   assert.equal(tool.status, 'failed');
@@ -440,14 +579,14 @@ test('permission outcome joins the tool call in the transcript', async () => {
     toolUpdate: { sessionUpdate: 'tool_call', toolCallId: 'exec:0', title: 'Editar arquivo', kind: 'edit',
       rawInput: { path: '/tmp/f' } },
     permissionCall: { toolCallId: 'exec:0' } });
-  const d = s.delivery(); const running = s.type.run(d);
+  const d = s.delivery(); await s.type.run(d);
   await ready;
   const approve = findAll(s.page.component(), n => n.tag === 'button')
     .find(b => JSON.stringify(b.children).includes('Permitir uma vez'));
   approve.props.onClick();
   const promptReq = s.requests.find(m => m.method === 'session/prompt');
-  s.receive({ jsonrpc: '2.0', id: promptReq.id, result: { stopReason: 'end_turn' } });
-  await running;
+  s.processes[0].receive({ jsonrpc: '2.0', id: promptReq.id, result: { stopReason: 'end_turn' } });
+  await d.held[0];
   const stored = JSON.parse(s.storeData.get('devin.transcript.Agent'))['room/thread'][0];
   const tool = stored.items.find(i => i.t === 'tool');
   assert.equal(tool.perm.outcome, 'allow');
@@ -460,11 +599,13 @@ test('permission joins earlier tool update with the sparse real Devin request', 
     toolUpdate: { sessionUpdate: 'tool_call', toolCallId: 'exec:0', title: 'Ran printf', rawInput: { command: 'printf hello' },
       content: [{ type: 'content', content: { type: 'resource', resource: { text: 'printf hello' } } }] },
     permissionCall: { toolCallId: 'exec:0', _meta: { 'cognition.ai/editableCommand': 'printf hello' } } });
-  const d = s.delivery(); const running = s.type.run(d); const rejected = assert.rejects(running, /interrompido/);
+  const d = s.delivery(); await s.type.run(d);
   await ready;
   const tree = JSON.stringify(s.page.component());
   assert.ok(tree.includes('Ran printf')); assert.ok(tree.includes('printf hello'));
-  await d.controller.stop(); await rejected;
+  await d.controller.stop();
+  const outcome = await d.held[0];
+  assert.equal(outcome.stopped, true);
 });
 
 const usageArgs = (since = 0) => ({ since, signal: new AbortController().signal });
@@ -503,7 +644,9 @@ test('each /session-stats request becomes an observation and persists with a sta
     statRequest({ requestId: 'r2', createdAt: '2026-01-02T10:00:05Z',
       responseDimensions: [{ uid: 'input_tokens', kind: { value: 100 } },
         { uid: 'output_tokens', kind: { value: 10 } }] }) ] } });
-  await s.type.run(s.delivery());
+  const d = s.delivery();
+  await s.type.run(d);
+  await d.held[0];
   assert.ok(s.requests.some(m => m.method === 'session/prompt' && m.params.prompt[0].text === '/session-stats'));
   const sessions = await s.type.usage({ key: 'Agent' }, usageArgs());
   assert.equal(sessions.length, 1);
@@ -536,7 +679,9 @@ test('each /session-stats request becomes an observation and persists with a sta
 
 test('usage falls back to consolidated prompt usage with cached input separated', async () => {
   const s = setup({ promptUsage: { totalTokens: 13834, inputTokens: 13802, outputTokens: 32, cachedReadTokens: 512 } });
-  await s.type.run(s.delivery());
+  const d = s.delivery();
+  await s.type.run(d);
+  await d.held[0];
   const sessions = await s.type.usage({ key: 'Agent' }, usageArgs());
   assert.equal(sessions[0].observations.length, 1);
   assert.deepEqual(sessions[0].observations[0].tokens, { input: 13290, output: 32, cacheRead: 512 });
@@ -548,7 +693,9 @@ test('usage falls back to the usage_update counters when nothing else reports', 
     { sessionUpdate: 'usage_update', used: 13834, size: 262000,
       _meta: { 'cognition.ai/inputTokens': 13802, 'cognition.ai/outputTokens': 32,
         'cognition.ai/cachedReadTokens': 512 } } ] });
-  await s.type.run(s.delivery());
+  const d = s.delivery();
+  await s.type.run(d);
+  await d.held[0];
   const sessions = await s.type.usage({ key: 'Agent' }, usageArgs());
   assert.deepEqual(sessions[0].observations[0].tokens, { input: 13290, output: 32, cacheRead: 512 });
   assert.ok(sessions[0].gaps[0].includes('summed'));
@@ -556,7 +703,9 @@ test('usage falls back to the usage_update counters when nothing else reports', 
 
 test('a turn without usage still records its session with a gap, never failing the turn', async () => {
   const s = setup();
-  await s.type.run(s.delivery());
+  const d = s.delivery();
+  await s.type.run(d);
+  await d.held[0];
   const sessions = await s.type.usage({ key: 'Agent' }, usageArgs());
   assert.equal(sessions.length, 1);
   assert.deepEqual(sessions[0].observations, []);
@@ -570,7 +719,9 @@ test('usage reloads stored sessions, prunes the surplus and honors abort', async
   for (let i = 0; i < 210; i++)
     rows.push({ id: `old${i}`, startedAt: Date.now() - 60000 - i, lastAt: Date.now() - 60000 - i, observations: [] });
   s.storeData.set('devin.usage.Agent', JSON.stringify({ v: 1, sessions: rows }));
-  await s.type.run(s.delivery());
+  const d = s.delivery();
+  await s.type.run(d);
+  await d.held[0];
   await flush();
   const stored = JSON.parse(s.storeData.get('devin.usage.Agent'));
   assert.equal(stored.sessions.length, 200);
@@ -583,7 +734,9 @@ test('usage reloads stored sessions, prunes the surplus and honors abort', async
 
 test('quota refresh after a turn asks the declared origin and paints the panel detail', async () => {
   const s = setup({ credentials: creds, quota: quotaBody('Pro') });
-  await s.type.run(s.delivery());
+  const d = s.delivery();
+  await s.type.run(d);
+  await d.held[0];
   await flush(); await flush();
   assert.equal(s.hostRequests.length, 1);
   const call = s.hostRequests[0];
@@ -607,7 +760,9 @@ test('quota renewal shows hours for resets under 48h', async () => {
     weeklyQuotaResetAtUnix: 1901000000, planInfo: { planName: 'Pro' } } },
     planInfo: { planName: 'Pro' } });
   const s = setup({ credentials: creds, quota });
-  await s.type.run(s.delivery());
+  const d = s.delivery();
+  await s.type.run(d);
+  await d.held[0];
   await flush(); await flush();
   const text = render(s.panel.component());
   assert.ok(text.includes('Renova em 5 horas ('));
@@ -615,7 +770,9 @@ test('quota renewal shows hours for resets under 48h', async () => {
 
 test('quota also accepts a root-level planStatus without the userStatus envelope', async () => {
   const s = setup({ credentials: creds, quota: quotaBody('Pro', false) });
-  await s.type.run(s.delivery());
+  const d = s.delivery();
+  await s.type.run(d);
+  await d.held[0];
   await flush(); await flush();
   const text = render(s.panel.component());
   assert.ok(text.includes('Limite diário:') && text.includes('65% restante'));
@@ -624,7 +781,9 @@ test('quota also accepts a root-level planStatus without the userStatus envelope
 test('a connected Codex adds a second cluster beside Devin with its own windows', async () => {
   const s = setup({ credentials: creds, quota: quotaBody('Pro'),
     codexAuth: codexAuthBody, codexQuota: codexQuotaBody });
-  await s.type.run(s.delivery());
+  const d = s.delivery();
+  await s.type.run(d);
+  await d.held[0];
   await flush(); await flush();
   const call = s.hostRequests.find(r => r.url.includes('chatgpt.com'));
   assert.equal(call.method, 'GET');
@@ -644,7 +803,9 @@ test('an expired Codex token falls back to the newest rollout rate_limits event'
   const s = setup({ credentials: creds, quota: quotaBody('Pro'),
     codexAuth: codexAuthBody, codexQuota: { status: 401, headers: {}, body: '{}' },
     commands: { 'codex-rollout': rolloutOut } });
-  await s.type.run(s.delivery());
+  const d = s.delivery();
+  await s.type.run(d);
+  await d.held[0];
   await flush(); await flush();
   const text = render(s.panel.component());
   assert.ok(text.includes('Codex · Plus'));
@@ -657,7 +818,9 @@ test('an expired Codex token falls back to the newest rollout rate_limits event'
 test('an expired Codex token without a rollout degrades to grey rings and the reason', async () => {
   const s = setup({ codexAuth: codexAuthBody, codexQuota: { status: 401, headers: {}, body: '{}' },
     commands: { 'codex-rollout': null } });
-  await s.type.run(s.delivery());
+  const d = s.delivery();
+  await s.type.run(d);
+  await d.held[0];
   await flush(); await flush();
   const text = render(s.panel.component());
   assert.ok(!text.includes('Devin ·'));
@@ -667,7 +830,9 @@ test('an expired Codex token without a rollout degrades to grey rings and the re
 test('without credentials the indicator degrades instead of breaking the toolbar', async () => {
   const s = setup();
   assert.equal(s.panel.id, 'devin-quota');
-  await s.type.run(s.delivery());
+  const d = s.delivery();
+  await s.type.run(d);
+  await d.held[0];
   await flush();
   const toolbar = render(s.panel.toolbar());
   assert.ok(toolbar.includes('Limites de uso'));

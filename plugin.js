@@ -7,7 +7,7 @@ export function apply(ctx) {
   if (!agents.harness || !host.spawn || !host.serveMcp || !host.resolveDirectory || !host.readFile)
     throw new Error("Esta versão do Buzz não oferece o contrato de harness/MCP necessário.");
   const h = R.createElement;
-  const active = new Map();
+  const lanes = new Map();
   const approvals = new Map();
   const listeners = new Set();
   const catalogs = new Map();
@@ -19,7 +19,7 @@ export function apply(ctx) {
     dangerous: "Bypass: permitir todas as ferramentas",
   };
   const busyModes = {
-    queue: "Fila: recusar enquanto o turno executa",
+    queue: "Fila: executar em sequência na mesma conversa",
     steer: "Steer: incorporar no turno em execução",
   };
   let disposed = false;
@@ -161,8 +161,8 @@ export function apply(ctx) {
   }
   function busyHint(mode) {
     return mode === "steer"
-      ? "Mensagens que chegam durante um turno são injetadas na sessão em execução e o Devin incorpora o novo pedido na mesma resposta."
-      : "Mensagens que chegam durante um turno aguardam o fim da execução; um segundo turno simultâneo é recusado.";
+      ? "Mensagens que chegam durante um turno são injetadas na sessão em execução e o Devin incorpora o novo pedido na mesma resposta. Conversas diferentes sempre rodam em paralelo."
+      : "Mensagens que chegam durante um turno aguardam o fim da execução e viram o próximo turno na mesma conversa. Conversas diferentes sempre rodam em paralelo.";
   }
   // The catalog select Codex-style: just the pill, saving on each pick through
   // the host's own onChange. Loading and recovery stay with the field.
@@ -787,7 +787,8 @@ export function apply(ctx) {
           ? () => openConversation(row.channel, row.root) : undefined });
     }
     const here = conversation ? rows.find(row => row.key === hereKey) : undefined;
-    const working = Boolean(hereKey && active.has(`${agent.key}/${hereKey}`));
+    const laneState = hereKey ? lanes.get(`${agent.key}/${hereKey}`) : undefined;
+    const working = Boolean(laneState && (laneState.active || laneState.queue.length));
     const recent = rows.filter(row => row.key !== hereKey);
     const nameOf = row => row.where || row.channel.slice(0, 8);
     const rowStyle = { display: "flex", alignItems: "center", flexWrap: "wrap", gap: "var(--space-3)", minWidth: 0 };
@@ -1118,7 +1119,11 @@ export function apply(ctx) {
     disposed = true;
     for (const stop of probes) void stop();
     for (const item of [...approvals.values()]) item.finish({ outcome: "cancelled" });
-    for (const item of active.values()) void item.stop();
+    for (const lane of lanes.values()) {
+      for (const entry of lane.queue.splice(0)) entry.finish({ ok: true, stopped: true });
+      if (lane.active) void lane.active.stop();
+    }
+    lanes.clear();
     listeners.clear();
   });
 
@@ -1157,12 +1162,83 @@ export function apply(ctx) {
     return (parts.join("\n\n") || "O Devin não forneceu os argumentos desta ação. Recuse se não puder avaliar o pedido.").slice(0, 16000);
   }
 
-  // A delivery that arrives mid-turn with busyMode "steer" joins the running
-  // ACP session instead of spawning: it sends only its own prompt text on the
-  // shared sessionId and waits for its request, which Devin resolves together
-  // with the owner's. Reply text, stats and usage stay with the owning run;
-  // the joined run's transcript mark lands in the owner's turn.
-  async function steerTurn(delivery, conversation, handle) {
+  // Deliveries are admitted into a per-conversation lane: run() registers the
+  // work item (workingUntil) and returns, so the host's mention lane frees for
+  // the next delivery. A same-conversation delivery joins the live ACP session
+  // when the lane allows it (busyMode "steer", joinable turn, compatible
+  // settings), queues as the next turn otherwise, and a different conversation
+  // always gets its own lane — spawning sessions in parallel.
+  const errorText = error => error instanceof Error ? error.message : String(error);
+  function laneOf(key) {
+    let lane = lanes.get(key);
+    if (!lane) lanes.set(key, lane = { key, tail: Promise.resolve(), queue: [] });
+    return lane;
+  }
+  // The lane tail serializes turns per conversation. It never rejects: a dead
+  // turn releases the tail so the queue keeps moving.
+  function enqueue(lane, entry) {
+    if (entry.settled) return;
+    lane.queue.push(entry);
+    lane.tail = lane.tail.then(() => drain(lane).catch(() => {}));
+    emit();
+  }
+  async function drain(lane) {
+    let entry;
+    while ((entry = lane.queue.shift())) {
+      if (entry.settled) continue;
+      try { await executeTurn(lane, entry); }
+      catch (error) { entry.finish({ ok: false, error: errorText(error) }); }
+    }
+    if (!lane.queue.length && !lane.active && lanes.get(lane.key) === lane) lanes.delete(lane.key);
+  }
+  async function run(delivery) {
+    const kit = agents.harness;
+    const conversation = await kit.conversation(delivery, "thread");
+    if (!conversation || !delivery.current()) { delivery.ignored?.(); return; }
+    if (delivery.agent.protection) throw new Error("Este harness não executa agentes protegidos.");
+    const lane = laneOf(`${delivery.agent.key}/${conversation.key}`);
+    const cfg = config(delivery.config);
+    const entry = { delivery, conversation, cfg, settled: false };
+    const done = new Promise(resolve => {
+      entry.finish = outcome => { if (!entry.settled) { entry.settled = true; resolve(outcome); } };
+    });
+    // The work item's stop depends on where the entry sits: joined aborts only
+    // its own request, queued leaves the lane, and the owner kills the process.
+    const stop = async () => {
+      if (entry.settled) return;
+      if (entry.joinedAbort) { entry.joinedAbort(); return; }
+      const at = lane.queue.indexOf(entry);
+      if (at >= 0) lane.queue.splice(at, 1);
+      if (lane.active?.entry === entry) return lane.active.stop();
+      entry.finish({ ok: true, stopped: true });
+    };
+    delivery.interruptible?.(stop);
+    delivery.workingUntil?.(done);
+    const active = lane.active;
+    if (active?.joinable && active.steer && cfg.busyMode === "steer" && !lane.queue.length)
+      void join(lane, active, entry)
+        .catch(() => entry.finish({ ok: false, error: "Falha ao incorporar a mensagem." }));
+    else enqueue(lane, entry);
+  }
+  // Steering admissions serialize on the handle so a second joined delivery
+  // re-evaluates the lane after the first, like the bundled Codex runtime.
+  function join(lane, active, entry) {
+    const attempt = active.steering.then(() => admitJoin(lane, active, entry));
+    active.steering = attempt.catch(() => {});
+    return attempt;
+  }
+  async function admitJoin(lane, active, entry) {
+    const { delivery, conversation, cfg } = entry;
+    if (entry.settled) return;
+    if (disposed || delivery.signal.aborted || !delivery.current())
+      return entry.finish({ ok: true, stopped: true });
+    // Steering cannot switch model or permission mode, and nothing may jump
+    // the lane queue: any of those becomes the next turn instead.
+    const model = delivery.model || cfg.model;
+    if (lane.active !== active || !active.joinable || !active.steer || lane.queue.length
+        || (model && active.model && model !== active.model)
+        || cfg.permissionMode !== active.permissionMode)
+      return enqueue(lane, entry);
     const kit = agents.harness;
     const controller = new AbortController();
     const forward = () => controller.abort();
@@ -1170,43 +1246,47 @@ export function apply(ctx) {
     if (delivery.signal.aborted) forward();
     // Stopping a joined delivery only drops its own request; the message is
     // already in the session and the owner's process keeps running.
-    const stop = async () => { controller.abort(); };
-    delivery.interruptible?.(stop);
+    entry.joinedAbort = () => controller.abort();
     let prompt, received = false;
     try {
       prompt = await kit.turnPrompt(delivery, conversation);
       controller.signal.throwIfAborted();
       if (!delivery.current()) throw new Error("Esta solicitação não está mais ativa.");
-      if (!handle.joinable || !handle.steer)
-        throw new Error("O Devin já está trabalhando nesta conversa. Aguarde ou use Stop.");
-      delivery.acknowledged?.();
-      received = true;
-      const steering = handle.steer(prompt.text, controller.signal);
+      if (disposed || lane.active !== active || !active.joinable || !active.steer || lane.queue.length)
+        throw new Error("O turno não aceita mais mensagens.");
+      delivery.acknowledged?.({ steering: true });
+      entry.acked = received = true;
+      const steering = active.steer(prompt.text, controller.signal);
       const request = requestFrom(delivery, prompt.text);
-      push(handle.turn, { t: "status",
+      push(active.turn, { t: "status",
         text: `${request.author} adicionou ao turno em execução: ${clip(request.text, 300)}` });
       saveTranscripts(delivery.agent.key);
       delivery.step?.("Devin", "Mensagem incorporada ao turno em execução");
       await steering;
+      entry.finish({ ok: true });
+    } catch (error) {
+      if (!received) prompt?.restore?.();
+      if (controller.signal.aborted || delivery.signal.aborted || disposed || !delivery.current())
+        entry.finish({ ok: true, stopped: true });
+      else if (active.stopped) entry.finish({ ok: false, error: errorText(error) });
+      else {
+        // The session ended between the check and the steer, so the mention
+        // becomes the next turn — Codex's "no active turn to steer" queue.
+        // Once acknowledged, reuse the prompt the kit already built for it.
+        if (received && prompt) entry.promptText = prompt.text;
+        enqueue(lane, entry);
+      }
     } finally {
-      if (!received) prompt?.restore();
+      entry.joinedAbort = undefined;
       delivery.signal.removeEventListener("abort", forward);
       emit();
     }
   }
-  async function run(delivery) {
+  async function executeTurn(lane, entry) {
+    const { delivery, conversation, cfg } = entry;
+    if (disposed || delivery.signal.aborted || !delivery.current())
+      return entry.finish({ ok: true, stopped: true });
     const kit = agents.harness;
-    const conversation = await kit.conversation(delivery, "thread");
-    if (!conversation || !delivery.current()) { delivery.ignored?.(); return; }
-    if (delivery.agent.protection) throw new Error("Este harness não executa agentes protegidos.");
-    const key = `${delivery.agent.key}/${conversation.key}`;
-    const cfg = config(delivery.config);
-    const existing = active.get(key);
-    if (existing) {
-      if (cfg.busyMode === "steer" && existing.joinable && existing.steer)
-        return steerTurn(delivery, conversation, existing);
-      throw new Error("O Devin já está trabalhando nesta conversa. Aguarde ou use Stop.");
-    }
     const controller = new AbortController();
     const forward = () => controller.abort();
     delivery.signal.addEventListener("abort", forward, { once: true });
@@ -1214,19 +1294,20 @@ export function apply(ctx) {
     let process, server, prompt, received = false, replied = false;
     const pending = new Map();
     const toolCalls = new Map();
-    let sequence = 0, buffer = "", finalText = "", lastStep = "", outcome, fatal;
+    let sequence = 0, buffer = "", finalText = "", lastStep = "", outcome, failure, fatal;
     // Usage capture: the session id, its model in use, the latest context
     // window report, and /session-stats data collected after the turn.
     let acpSession, sessionModel = "", contextUse, promptUsage;
     let statsCollecting = false, statsData, statsDone;
     const rejectAll = error => { fatal = error; for (const p of pending.values()) { clearTimeout(p.timer); p.reject(error); } pending.clear(); };
     const stop = async () => {
+      handle.stopped = true;
       controller.abort(); rejectAll(new Error("Turno interrompido."));
       if (process) await process.kill();
     };
-    const handle = { stop, joinable: false, steer: undefined, turn: undefined };
-    active.set(key, handle);
-    delivery.interruptible?.(stop);
+    const handle = { entry, stop, joinable: false, steer: undefined, turn: undefined,
+      steering: Promise.resolve(), stopped: false, model: "", permissionMode: cfg.permissionMode };
+    lane.active = handle;
     recordActivity(delivery.agent.key, conversation, "working");
     const turn = beginTurn(delivery.agent.key, conversation);
     handle.turn = turn;
@@ -1370,6 +1451,7 @@ export function apply(ctx) {
         const field = acpSession.configOptions?.find?.(o => o?.category === "model" && o?.type === "select");
         sessionModel = field?.currentValue || acpSession.models?.currentModelId || delivery.model || cfg.model || "";
       }
+      handle.model = sessionModel;
       if (cfg.permissionMode !== "auto") {
         const modeId = cfg.permissionMode === "dangerous" ? "bypass" : cfg.permissionMode;
         if (!acpSession.modes?.availableModes?.some(mode => mode.id === modeId))
@@ -1377,12 +1459,14 @@ export function apply(ctx) {
         await request("session/set_mode", { sessionId: acpSession.sessionId, modeId });
       }
       const system = await kit.systemPrompt(delivery, { scope: "thread", cwd, instructions: cfg.instructions, tools: true });
-      prompt = await kit.turnPrompt(delivery, conversation);
+      // A delivery the session dropped after acknowledging it brings the
+      // prompt the kit already built; a fresh one asks for it now.
+      prompt = entry.promptText === undefined ? await kit.turnPrompt(delivery, conversation) : { text: entry.promptText };
       turn.sections = sectionsOf(system);
       turn.request = requestFrom(delivery, prompt.text);
       controller.signal.throwIfAborted();
       if (!delivery.current()) throw new Error("Esta solicitação não está mais ativa.");
-      delivery.acknowledged?.();
+      if (!entry.acked) { delivery.acknowledged?.(); entry.acked = true; }
       received = true;
       handle.joinable = true;
       let result;
@@ -1399,8 +1483,13 @@ export function apply(ctx) {
       await statsDone;
       outcome = "done";
     } catch (error) {
-      outcome = controller.signal.aborted || delivery.signal.aborted ? "cancelled" : "failed";
-      throw error;
+      outcome = controller.signal.aborted || delivery.signal.aborted || disposed ? "cancelled" : "failed";
+      failure = errorText(error);
+      // A turn that already acknowledged its mention reports the failure in
+      // the conversation; the run() return no longer reaches the host log.
+      if (outcome === "failed" && received)
+        try { await kit.reply(delivery.agent, conversation, `O turno falhou: ${clip(failure, 400)}`); }
+        catch { /* reporting is best-effort */ }
     } finally {
       turn.end = Date.now();
       turn.outcome = outcome ?? "failed";
@@ -1422,13 +1511,17 @@ export function apply(ctx) {
       emit();
       if (received) recordActivity(delivery.agent.key, conversation, outcome ?? "failed",
         finalText.trim().slice(-800) || (lastStep && `Devin: ${lastStep}`) || undefined);
-      if (!received) prompt?.restore();
+      if (!received) prompt?.restore?.();
       controller.abort();
       delivery.signal.removeEventListener("abort", forward);
       controller.signal.removeEventListener("abort", abort);
       rejectAll(new Error("Sessão encerrada."));
       try { if (process) { await process.kill(); await process.exited; } }
-      finally { try { await server?.close(); } finally { active.delete(key); } }
+      finally { try { await server?.close(); } finally {
+        if (lane.active === handle) lane.active = undefined;
+        entry.finish(outcome === "failed" ? { ok: false, error: failure ?? "O turno falhou." }
+          : outcome === "cancelled" ? { ok: true, stopped: true } : { ok: true });
+        emit(); } }
     }
   }
   agents.register({
